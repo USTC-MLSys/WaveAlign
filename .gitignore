@@ -284,6 +284,9 @@ run_*.sh
 check_*.py
 fix_*.py
 
+# Required by the tracked pre-commit configuration.
+!/tools/pre_commit/check_pickle_imports.py
+
 # 私钥 & 临时文件
 dzj_id_rsa
 content.txt
