@@ -1,0 +1,14 @@
+--- a/xattn/src/Xattention.py
++++ b/xattn/src/Xattention.py
+@@ -7,7 +7,10 @@
+     softmax_fuse_block_sum,
+     flat_group_gemm_fuse_reshape,
+ )
+-from block_sparse_attn import block_sparse_attn_func
++def block_sparse_attn_func(*args, **kwargs):
++    # Estimation does not need this separate execution backend.
++    from block_sparse_attn import block_sparse_attn_func as implementation
++    return implementation(*args, **kwargs)
+ 
+ 
+ def xattn_estimate(

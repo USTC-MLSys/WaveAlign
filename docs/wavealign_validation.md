@@ -1,5 +1,7 @@
 # GPU validation (2026-11-12)
 
+This page records the initial synthetic-mask phase. Subsequent [real-model validation](wavealign_real_model_validation.md) downloaded Wan weights and exercised both Diffusers and the native vLLM-Omni entrypoint; it found exact output preservation but slower generation under forced reordering.
+
 The physical test device was one NVIDIA A100-SXM4-80GB (SM80, 108 SMs), with CUDA 13.0, PyTorch 2.12.0+cu130, and the [modified FlashInfer](../third_party/flashinfer/README.md) at `9215ce86df41f9b9005eb0c34ff23bdc281327a7`.
 
 ## Correctness and portability
@@ -29,4 +31,4 @@ The shorter 8K/32K/131K cases were slower after including overhead. Full-path ti
 
 The centered iteration currently uses dense batched matrix multiplication; its cost is not the paper's sparse `O(T * nnz)` implementation. The trained adaptive-skip policy is not included in the supplied source, so the measurements force reordering.
 
-No video model weights or real captured masks were available for this run. Wan/LTX end-to-end latency, video-quality metrics, and the paper's H100/A40 figures have not been reproduced. Nsight Compute could not acquire a driver profiling resource, so no measured L2-hit-rate or HBM-traffic claims are made.
+No model weights or real captured masks were used in this initial phase. The later real-model report adds Wan generation and real-mask measurements; LTX, benchmark-wide video quality, and the paper's H100/A40 figures remain unverified. Nsight Compute could not acquire a driver profiling resource, so no measured L2-hit-rate or HBM-traffic claims are made.
