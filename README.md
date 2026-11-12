@@ -8,7 +8,9 @@ This repository contains research code built on [vLLM-Omni](https://github.com/v
 
 ## Installation
 
-Prepare a Linux environment with Python 3.12, compatible CUDA/PyTorch and vLLM 0.20.0. The sparse backend also requires FlashAttention with the `flash_attn.cute` sparse APIs and XAttention importable as `xattn.src.Xattention`. Install SpargeAttn separately if using `SPARSE_MODE=sparge`.
+Prepare a Linux environment with Python 3.12, compatible CUDA/PyTorch and vLLM 0.20.0. XAttention must be importable as `xattn.src.Xattention`; install SpargeAttn separately if using `SPARSE_MODE=sparge`.
+
+Sparse execution selects FlashAttention 4 on supported Hopper/Blackwell devices when installed, and the [pinned per-head FlashInfer fork](third_party/flashinfer/README.md) otherwise, including A100/A40. See [hardware configuration](third_party/flashinfer/README.md#hardware-configuration) for overrides and validation limits.
 
 ```bash
 git clone https://github.com/USTC-MLSys/WaveAlign.git
@@ -40,6 +42,7 @@ Use `VLLM_MODE=no_reorder` for the sparse baseline or `VLLM_MODE=nnz_reorder` fo
 - [Reordering algorithms](vllm_omni/diffusion/attention/backends/greedy_reorder_cuda.py)
 - [Attention integration](vllm_omni/diffusion/attention/backends/flash_attn.py)
 - [Video generation and profiling](examples/offline_inference/text_to_video/)
+- [GPU validation and limitations](docs/wavealign_validation.md)
 
 ## Acknowledgments and License
 

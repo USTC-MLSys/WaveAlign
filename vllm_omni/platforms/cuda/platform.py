@@ -56,13 +56,14 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         from vllm_omni.diffusion.envs import PACKAGES_CHECKER
 
         # Check compute capability for Flash Attention support
-        # Flash Attention requires compute capability >= 8.0 and < 10.0
+        # FA4 also supports Blackwell. The sparse dispatcher selects a kernel
+        # for the actual device instead of excluding all SM100+ devices here.
         compute_capability = cls.get_device_capability()
         compute_supported = False
         if compute_capability is not None:
             major, minor = compute_capability
             capability = major * 10 + minor
-            compute_supported = 80 <= capability < 100
+            compute_supported = capability >= 80
 
         # Check if FA packages are available
         packages_info = PACKAGES_CHECKER.get_packages_info()
@@ -76,8 +77,8 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
                 if not compute_supported:
                     logger.warning(
-                        "Flash Attention requires GPU with compute capability >= 8.0 "
-                        "and < 10.0. Falling back to TORCH_SDPA backend."
+                        "Flash Attention requires GPU with compute capability >= 8.0. "
+                        "Falling back to TORCH_SDPA backend."
                     )
                 elif not packages_available:
                     logger.warning("Flash Attention packages not available. Falling back to TORCH_SDPA backend.")

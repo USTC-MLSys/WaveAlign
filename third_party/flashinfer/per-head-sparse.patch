@@ -1,0 +1,1011 @@
+diff --git a/flashinfer/__init__.py b/flashinfer/__init__.py
+index 77b2c3e8f81db8092566fe3e912021c9f1b2b106..9a4ba1f5f52bffd79abb71eabcae0ed0b162e313 100644
+--- a/flashinfer/__init__.py
++++ b/flashinfer/__init__.py
+@@ -184,6 +184,9 @@ from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
+ from .sparse import (
+     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
+ )
++from .per_head_bsaw import (
++    PerHeadBlockSparseAttentionWrapper as PerHeadBlockSparseAttentionWrapper,
++)
+ from .trtllm_low_latency_gemm import (
+     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
+ )
+diff --git a/flashinfer/jit/attention/modules.py b/flashinfer/jit/attention/modules.py
+index 00acfd21a627e514c4ef51f4be087a6c2d86ea31..4f6574c5417a0691ba0df315eae41d1c36af1e2d 100755
+--- a/flashinfer/jit/attention/modules.py
++++ b/flashinfer/jit/attention/modules.py
+@@ -1625,7 +1625,12 @@ def gen_customize_batch_prefill_module(
+ 
+         generated_config_path = gen_directory / "batch_prefill_config.inc"
+         write_if_different(generated_config_path, generated_inc_str)
+-        return gen_jit_spec(uri, source_paths)
++        return gen_jit_spec(
++            uri,
++            source_paths,
++            extra_cuda_cflags=["-rdc=true"],
++            needs_device_linking=True,
++        )
+     elif backend == "fa3":
+         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+         (additional_params_decl, additional_func_params, additional_params_setter) = (
+@@ -1700,7 +1705,8 @@ def gen_customize_batch_prefill_module(
+         return gen_jit_spec(
+             uri,
+             source_paths,
+-            extra_cuda_cflags=sm90a_nvcc_flags,
++            extra_cuda_cflags=sm90a_nvcc_flags + ["-rdc=true"],
++            needs_device_linking=True,
+         )
+     else:
+         raise ValueError(f"Invalid backend: {backend}")
+diff --git a/flashinfer/jit/cpp_ext.py b/flashinfer/jit/cpp_ext.py
+index f2e5527b17ed4a4dc1969c0bcbd3ab9e4f78ea8b..8bf112e499ef03d3b33cf3af8774cb72e81b9788 100644
+--- a/flashinfer/jit/cpp_ext.py
++++ b/flashinfer/jit/cpp_ext.py
+@@ -200,9 +200,19 @@ def build_cuda_cflags(
+         "--compiler-options=-fPIC",
+         "--expt-relaxed-constexpr",
+     ]
++    env_extra_cuda_cflags = parse_env_flags("FLASHINFER_EXTRA_CUDAFLAGS")
++    requested_cuda_cflags = list(extra_cuda_cflags or []) + env_extra_cuda_cflags
++    needs_rdc = any(
++        flag in ("-rdc=true", "--relocatable-device-code=true", "-dc", "--device-c")
++        or flag.startswith("-rdc=")
++        or flag.startswith("--relocatable-device-code=")
++        for flag in requested_cuda_cflags
++    )
++
+     cuda_version = get_cuda_version()
+-    # enable -static-global-template-stub when cuda version >= 12.8
+-    if cuda_version >= Version("12.8"):
++    # CUDA 13 can fail in generated host stubs when this flag is combined with
++    # relocatable device code. RDC modules rely on nvcc device linking instead.
++    if cuda_version >= Version("12.8") and not needs_rdc:
+         cuda_cflags += [
+             "-static-global-template-stub=false",
+         ]
+@@ -228,8 +238,7 @@ def build_cuda_cflags(
+         # No module flags, use global flags
+         cuda_cflags += global_flags
+ 
+-    env_extra_cuda_cflags = parse_env_flags("FLASHINFER_EXTRA_CUDAFLAGS")
+-    if env_extra_cuda_cflags is not None:
++    if env_extra_cuda_cflags:
+         cuda_cflags += env_extra_cuda_cflags
+ 
+     return cuda_cflags
+diff --git a/flashinfer/per_head_bsaw.py b/flashinfer/per_head_bsaw.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1544f962073c54d425f7d2b9f408c007270d9b06
+--- /dev/null
++++ b/flashinfer/per_head_bsaw.py
+@@ -0,0 +1,787 @@
++"""
++Copyright (c) 2026 by FlashInfer contributors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++"""
++
++from __future__ import annotations
++
++import os
++import time
++from typing import Optional, Sequence, Union
++
++import torch
++
++from .prefill import (
++    BatchPrefillWithPagedKVCacheWrapper,
++    PosEncodingMode,
++    determine_attention_backend,
++    get_batch_prefill_module,
++)
++from .sparse import BlockSparseAttentionWrapper
++
++
++class PerHeadBlockSparseAttentionWrapper:
++    """Block-sparse attention wrapper with one CSR mask per KV head.
++
++    The concurrent path flattens ``(kv_head, block_row)`` into the paged
++    prefill batch dimension. This keeps one kernel-facing sparse plan while
++    preserving independent CSR structures for each KV head.
++    """
++
++    def __init__(
++        self,
++        float_workspace_buffer: torch.Tensor,
++        backend: str = "auto",
++    ) -> None:
++        self._float_workspace_buffer = float_workspace_buffer
++        self._backend = backend
++        self.device = float_workspace_buffer.device
++
++        self._planned = False
++        self._sequential_heads = False
++        self._concurrent_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
++        self._sequential_wrappers: list[BlockSparseAttentionWrapper] = []
++        self._last_plan_debug: Optional[dict[str, float]] = None
++        self._pending_plan_debug: dict[str, float] = {}
++
++    def _debug_plan_enabled(self) -> bool:
++        return os.environ.get("FLASHINFER_PERHEAD_BSA_DEBUG_PLAN", "0") == "1"
++
++    def _debug_sync_enabled(self) -> bool:
++        return os.environ.get("FLASHINFER_PERHEAD_BSA_DEBUG_PLAN_SYNC", "1") == "1"
++
++    def _maybe_sync(self) -> None:
++        if self._debug_sync_enabled():
++            torch.cuda.synchronize(self.device)
++
++    def _emit_plan_debug(self, stats: dict[str, float]) -> None:
++        self._last_plan_debug = dict(stats)
++        print("[per_head_bsaw.plan] breakdown:")
++        for key, value in stats.items():
++            if key.endswith("_ms"):
++                print(f"[per_head_bsaw.plan]   {key}: {value:.3f} ms")
++            else:
++                print(f"[per_head_bsaw.plan]   {key}: {value}")
++
++    def _concurrent_disable_split_kv(self) -> bool:
++        value = os.environ.get("FLASHINFER_PERHEAD_BSA_DISABLE_SPLIT_KV")
++        if value is None:
++            return False
++        return value not in {"0", "false", "False"}
++
++    def _concurrent_fixed_split_size(self) -> Optional[int]:
++        value = os.environ.get("FLASHINFER_PERHEAD_BSA_FIXED_SPLIT_SIZE")
++        if value is None or value == "":
++            return None
++        fixed_split_size = int(value)
++        if fixed_split_size <= 0:
++            return None
++        return fixed_split_size
++
++    def _use_specialized_concurrent(self) -> bool:
++        value = os.environ.get("FLASHINFER_PERHEAD_BSA_USE_SPECIALIZED_PLAN")
++        if value is None:
++            return True
++        return value not in {"0", "false", "False"}
++
++    @staticmethod
++    def _aligned_offset(offset: int, alignment: int) -> int:
++        return ((offset + alignment - 1) // alignment) * alignment
++
++    def _determine_cta_tile_q(self, avg_packed_qo_len: int) -> int:
++        if avg_packed_qo_len > 64 and self.head_dim < 256:
++            return 128
++        major, _minor = torch.cuda.get_device_capability(self.device)
++        if major >= 8:
++            return 64 if avg_packed_qo_len > 16 else 16
++        return 64
++
++    def _write_int_workspace_tensor(
++        self,
++        host_buffer: torch.Tensor,
++        *,
++        offset: int,
++        data: torch.Tensor,
++    ) -> None:
++        byte_size = data.numel() * data.element_size()
++        host_buffer[offset : offset + byte_size].view(data.dtype).copy_(
++            data.contiguous().view(-1).cpu(),
++        )
++
++    def plan(
++        self,
++        indptr_per_head: Sequence[torch.Tensor],
++        indices_per_head: Sequence[torch.Tensor],
++        M: int,
++        N: int,
++        R: int,
++        C: int,
++        num_qo_heads: int,
++        num_kv_heads: int,
++        head_dim: int,
++        *,
++        causal: bool = False,
++        sequential_heads: bool = False,
++        row_perm_per_head: Optional[Sequence[torch.Tensor]] = None,
++        reorder_algo: Optional[str] = None,
++        pos_encoding_mode: str = "NONE",
++        use_fp16_qk_reduction: bool = False,
++        logits_soft_cap: Optional[float] = None,
++        sm_scale: Optional[float] = None,
++        rope_scale: Optional[float] = None,
++        rope_theta: Optional[float] = None,
++        q_data_type: Union[str, torch.dtype] = "float16",
++        kv_data_type: Optional[Union[str, torch.dtype]] = None,
++        o_data_type: Union[str, torch.dtype] = "float16",
++        non_blocking: bool = True,
++    ) -> None:
++        if causal:
++            raise NotImplementedError(
++                "PerHeadBlockSparseAttentionWrapper profiling implementation does not support causal=True."
++            )
++        if row_perm_per_head is not None:
++            raise NotImplementedError(
++                "PerHeadBlockSparseAttentionWrapper expects Q/mask row reordering to be handled by the caller."
++            )
++        if reorder_algo is not None:
++            raise NotImplementedError(
++                "PerHeadBlockSparseAttentionWrapper does not implement internal row reorder algorithms."
++            )
++        if N % C != 0:
++            raise ValueError(f"Per-head BSA requires N % C == 0, got N={N}, C={C}.")
++        if num_qo_heads % num_kv_heads != 0:
++            raise ValueError(
++                "Per-head BSA requires grouped-query compatibility, "
++                f"got num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}."
++            )
++        if len(indptr_per_head) != num_kv_heads or len(indices_per_head) != num_kv_heads:
++            raise ValueError(
++                "Expected one CSR tensor pair per KV head, "
++                f"got {len(indptr_per_head)} indptr tensors and {len(indices_per_head)} indices tensors "
++                f"for num_kv_heads={num_kv_heads}."
++            )
++        debug_enabled = self._debug_plan_enabled()
++        debug_stats: dict[str, float] = {}
++        self._pending_plan_debug = {}
++        plan_t0 = time.perf_counter()
++
++        validate_t0 = time.perf_counter()
++        num_block_rows = (M + R - 1) // R
++        num_block_cols = N // C
++        for head_idx, (indptr, indices) in enumerate(zip(indptr_per_head, indices_per_head)):
++            if indptr.numel() != num_block_rows + 1:
++                raise ValueError(
++                    f"Head {head_idx} indptr length must be MB + 1 = {num_block_rows + 1}, "
++                    f"got {indptr.numel()}."
++                )
++            if indptr.dtype != torch.int32 or indices.dtype != torch.int32:
++                raise TypeError("indptr_per_head and indices_per_head must use torch.int32.")
++            if indptr.device != self.device or indices.device != self.device:
++                raise ValueError("CSR tensors must be on the same device as the workspace buffer.")
++            if indices.numel() and int(indices.max().item()) >= num_block_cols:
++                raise ValueError(
++                    f"Head {head_idx} has column indices outside NB={num_block_cols}."
++                )
++        if debug_enabled:
++            debug_stats["validate_ms"] = (time.perf_counter() - validate_t0) * 1000.0
++
++        self.M = M
++        self.N = N
++        self.R = R
++        self.C = C
++        self.num_qo_heads = num_qo_heads
++        self.num_kv_heads = num_kv_heads
++        self.head_dim = head_dim
++        self.group_size = num_qo_heads // num_kv_heads
++        self.num_block_rows = num_block_rows
++        self.num_block_cols = num_block_cols
++        self._o_dtype = o_data_type
++        self._sequential_heads = sequential_heads
++
++        if sequential_heads:
++            seq_t0 = time.perf_counter()
++            self._plan_sequential(
++                indptr_per_head=indptr_per_head,
++                indices_per_head=indices_per_head,
++                pos_encoding_mode=pos_encoding_mode,
++                use_fp16_qk_reduction=use_fp16_qk_reduction,
++                logits_soft_cap=logits_soft_cap,
++                sm_scale=sm_scale,
++                rope_scale=rope_scale,
++                rope_theta=rope_theta,
++                q_data_type=q_data_type,
++                kv_data_type=kv_data_type,
++                o_data_type=o_data_type,
++                non_blocking=non_blocking,
++            )
++            if debug_enabled:
++                debug_stats["plan_sequential_ms"] = (time.perf_counter() - seq_t0) * 1000.0
++        else:
++            conc_t0 = time.perf_counter()
++            if self._use_specialized_concurrent():
++                self._plan_concurrent_specialized(
++                    indptr_per_head=indptr_per_head,
++                    indices_per_head=indices_per_head,
++                    pos_encoding_mode=pos_encoding_mode,
++                    use_fp16_qk_reduction=use_fp16_qk_reduction,
++                    logits_soft_cap=logits_soft_cap,
++                    sm_scale=sm_scale,
++                    rope_scale=rope_scale,
++                    rope_theta=rope_theta,
++                    q_data_type=q_data_type,
++                    kv_data_type=kv_data_type,
++                    o_data_type=o_data_type,
++                    non_blocking=non_blocking,
++                )
++            else:
++                self._plan_concurrent(
++                    indptr_per_head=indptr_per_head,
++                    indices_per_head=indices_per_head,
++                    pos_encoding_mode=pos_encoding_mode,
++                    use_fp16_qk_reduction=use_fp16_qk_reduction,
++                    logits_soft_cap=logits_soft_cap,
++                    sm_scale=sm_scale,
++                    rope_scale=rope_scale,
++                    rope_theta=rope_theta,
++                    q_data_type=q_data_type,
++                    kv_data_type=kv_data_type,
++                    o_data_type=o_data_type,
++                    non_blocking=non_blocking,
++                )
++            if debug_enabled:
++                debug_stats["plan_concurrent_ms"] = (time.perf_counter() - conc_t0) * 1000.0
++
++        self._planned = True
++        if debug_enabled:
++            debug_stats["sequential_heads"] = 1.0 if sequential_heads else 0.0
++            debug_stats["num_block_rows"] = float(num_block_rows)
++            debug_stats["num_block_cols"] = float(num_block_cols)
++            debug_stats["num_qo_heads"] = float(num_qo_heads)
++            debug_stats["num_kv_heads"] = float(num_kv_heads)
++            debug_stats["plan_total_ms"] = (time.perf_counter() - plan_t0) * 1000.0
++            debug_stats.update(self._pending_plan_debug)
++            self._emit_plan_debug(debug_stats)
++
++    begin_forward = plan
++
++    def _plan_sequential(
++        self,
++        *,
++        indptr_per_head: Sequence[torch.Tensor],
++        indices_per_head: Sequence[torch.Tensor],
++        pos_encoding_mode: str,
++        use_fp16_qk_reduction: bool,
++        logits_soft_cap: Optional[float],
++        sm_scale: Optional[float],
++        rope_scale: Optional[float],
++        rope_theta: Optional[float],
++        q_data_type: Union[str, torch.dtype],
++        kv_data_type: Optional[Union[str, torch.dtype]],
++        o_data_type: Union[str, torch.dtype],
++        non_blocking: bool,
++    ) -> None:
++        self._concurrent_wrapper = None
++        self._sequential_wrappers = []
++        for indptr, indices in zip(indptr_per_head, indices_per_head):
++            wrapper = BlockSparseAttentionWrapper(
++                self._float_workspace_buffer,
++                backend=self._backend,
++            )
++            wrapper.plan(
++                indptr,
++                indices,
++                self.M,
++                self.N,
++                self.R,
++                self.C,
++                self.group_size,
++                1,
++                self.head_dim,
++                causal=False,
++                pos_encoding_mode=pos_encoding_mode,
++                use_fp16_qk_reduction=use_fp16_qk_reduction,
++                logits_soft_cap=logits_soft_cap,
++                sm_scale=sm_scale,
++                rope_scale=rope_scale,
++                rope_theta=rope_theta,
++                q_data_type=q_data_type,
++                kv_data_type=kv_data_type,
++                o_data_type=o_data_type,
++                non_blocking=non_blocking,
++            )
++            self._sequential_wrappers.append(wrapper)
++
++    def _plan_concurrent(
++        self,
++        *,
++        indptr_per_head: Sequence[torch.Tensor],
++        indices_per_head: Sequence[torch.Tensor],
++        pos_encoding_mode: str,
++        use_fp16_qk_reduction: bool,
++        logits_soft_cap: Optional[float],
++        sm_scale: Optional[float],
++        rope_scale: Optional[float],
++        rope_theta: Optional[float],
++        q_data_type: Union[str, torch.dtype],
++        kv_data_type: Optional[Union[str, torch.dtype]],
++        o_data_type: Union[str, torch.dtype],
++        non_blocking: bool,
++    ) -> None:
++        debug_enabled = self._debug_plan_enabled()
++        debug_stats = self._pending_plan_debug if debug_enabled else {}
++
++        t0 = time.perf_counter()
++        qo_boundaries = torch.arange(
++            0,
++            self.M + self.R,
++            self.R,
++            dtype=torch.int32,
++            device=self.device,
++        ).clamp_max(self.M)
++        head_row_offsets = (
++            torch.arange(self.num_kv_heads, dtype=torch.int32, device=self.device) * self.M
++        ).unsqueeze(1)
++        qo_indptr = torch.cat(
++            [
++                (qo_boundaries[:-1].unsqueeze(0) + head_row_offsets).reshape(-1),
++                qo_boundaries[-1:].add((self.num_kv_heads - 1) * self.M),
++            ]
++        )
++        if debug_enabled:
++            debug_stats["concurrent_qo_indptr_ms"] = (time.perf_counter() - t0) * 1000.0
++
++        t1 = time.perf_counter()
++        row_counts_per_head = torch.stack(
++            [indptr[1:] - indptr[:-1] for indptr in indptr_per_head],
++            dim=0,
++        )
++        flat_row_counts = row_counts_per_head.reshape(-1)
++        page_offsets = (
++            torch.arange(self.num_kv_heads, dtype=torch.int32, device=self.device) * self.num_block_cols
++        )
++        shifted_index_chunks = [
++            indices + page_offsets[head_idx]
++            for head_idx, indices in enumerate(indices_per_head)
++            if indices.numel()
++        ]
++        if debug_enabled:
++            debug_stats["concurrent_python_pack_ms"] = (time.perf_counter() - t1) * 1000.0
++            debug_stats["concurrent_total_pages"] = float(sum(indices.numel() for indices in indices_per_head))
++            debug_stats["concurrent_nonempty_rows"] = float((flat_row_counts > 0).sum().item())
++
++        t2 = time.perf_counter()
++        paged_kv_indptr = torch.cat(
++            [
++                torch.zeros(1, dtype=torch.int32, device=self.device),
++                torch.cumsum(flat_row_counts, dim=0, dtype=torch.int32),
++            ]
++        )
++        if shifted_index_chunks:
++            paged_kv_indices = torch.cat(shifted_index_chunks, dim=0)
++        else:
++            paged_kv_indices = torch.empty((0,), dtype=torch.int32, device=self.device)
++        paged_kv_last_page_len = torch.full(
++            (self.num_kv_heads * self.num_block_rows,),
++            self.C,
++            dtype=torch.int32,
++            device=self.device,
++        )
++        if debug_enabled:
++            self._maybe_sync()
++            debug_stats["concurrent_tensorize_ms"] = (time.perf_counter() - t2) * 1000.0
++
++        t3 = time.perf_counter()
++        wrapper = BatchPrefillWithPagedKVCacheWrapper(
++            self._float_workspace_buffer,
++            backend=self._backend,
++        )
++        if debug_enabled:
++            debug_stats["concurrent_wrapper_init_ms"] = (time.perf_counter() - t3) * 1000.0
++
++        t4 = time.perf_counter()
++        if debug_enabled:
++            self._maybe_sync()
++        disable_split_kv = self._concurrent_disable_split_kv()
++        fixed_split_size = self._concurrent_fixed_split_size()
++        wrapper.plan(
++            qo_indptr,
++            paged_kv_indptr,
++            paged_kv_indices,
++            paged_kv_last_page_len,
++            self.group_size,
++            1,
++            self.head_dim,
++            self.C,
++            causal=False,
++            pos_encoding_mode=pos_encoding_mode,
++            use_fp16_qk_reduction=use_fp16_qk_reduction,
++            logits_soft_cap=logits_soft_cap,
++            sm_scale=sm_scale,
++            rope_scale=rope_scale,
++            rope_theta=rope_theta,
++            q_data_type=q_data_type,
++            kv_data_type=kv_data_type,
++            o_data_type=o_data_type,
++            non_blocking=non_blocking,
++            fixed_split_size=fixed_split_size,
++            disable_split_kv=disable_split_kv,
++        )
++        if debug_enabled:
++            self._maybe_sync()
++            debug_stats["concurrent_disable_split_kv"] = 1.0 if disable_split_kv else 0.0
++            debug_stats["concurrent_fixed_split_size"] = (
++                float(fixed_split_size) if fixed_split_size is not None else -1.0
++            )
++            debug_stats["concurrent_wrapper_plan_ms"] = (time.perf_counter() - t4) * 1000.0
++        self._concurrent_wrapper = wrapper
++        self._sequential_wrappers = []
++
++    def _plan_concurrent_specialized(
++        self,
++        *,
++        indptr_per_head: Sequence[torch.Tensor],
++        indices_per_head: Sequence[torch.Tensor],
++        pos_encoding_mode: str,
++        use_fp16_qk_reduction: bool,
++        logits_soft_cap: Optional[float],
++        sm_scale: Optional[float],
++        rope_scale: Optional[float],
++        rope_theta: Optional[float],
++        q_data_type: Union[str, torch.dtype],
++        kv_data_type: Optional[Union[str, torch.dtype]],
++        o_data_type: Union[str, torch.dtype],
++        non_blocking: bool,
++    ) -> None:
++        debug_enabled = self._debug_plan_enabled()
++        debug_stats = self._pending_plan_debug if debug_enabled else {}
++
++        if self.group_size != 1:
++            if debug_enabled:
++                debug_stats["specialized_fallback_group_size"] = float(self.group_size)
++            self._plan_concurrent(
++                indptr_per_head=indptr_per_head,
++                indices_per_head=indices_per_head,
++                pos_encoding_mode=pos_encoding_mode,
++                use_fp16_qk_reduction=use_fp16_qk_reduction,
++                logits_soft_cap=logits_soft_cap,
++                sm_scale=sm_scale,
++                rope_scale=rope_scale,
++                rope_theta=rope_theta,
++                q_data_type=q_data_type,
++                kv_data_type=kv_data_type,
++                o_data_type=o_data_type,
++                non_blocking=non_blocking,
++            )
++            return
++
++        t0 = time.perf_counter()
++        qo_boundaries = torch.arange(
++            0,
++            self.M + self.R,
++            self.R,
++            dtype=torch.int32,
++            device=self.device,
++        ).clamp_max(self.M)
++        head_row_offsets = (
++            torch.arange(self.num_kv_heads, dtype=torch.int32, device=self.device) * self.M
++        ).unsqueeze(1)
++        qo_indptr = torch.cat(
++            [
++                (qo_boundaries[:-1].unsqueeze(0) + head_row_offsets).reshape(-1),
++                qo_boundaries[-1:].add((self.num_kv_heads - 1) * self.M),
++            ]
++        )
++        row_counts_per_head = torch.stack(
++            [indptr[1:] - indptr[:-1] for indptr in indptr_per_head],
++            dim=0,
++        )
++        flat_row_counts = row_counts_per_head.reshape(-1)
++        page_offsets = (
++            torch.arange(self.num_kv_heads, dtype=torch.int32, device=self.device)
++            * self.num_block_cols
++        )
++        shifted_index_chunks = [
++            indices + page_offsets[head_idx]
++            for head_idx, indices in enumerate(indices_per_head)
++            if indices.numel()
++        ]
++        paged_kv_indptr = torch.cat(
++            [
++                torch.zeros(1, dtype=torch.int32, device=self.device),
++                torch.cumsum(flat_row_counts, dim=0, dtype=torch.int32),
++            ]
++        )
++        if shifted_index_chunks:
++            paged_kv_indices = torch.cat(shifted_index_chunks, dim=0)
++        else:
++            paged_kv_indices = torch.empty((0,), dtype=torch.int32, device=self.device)
++        paged_kv_last_page_len = torch.full(
++            (self.num_kv_heads * self.num_block_rows,),
++            self.C,
++            dtype=torch.int32,
++            device=self.device,
++        )
++        if debug_enabled:
++            self._maybe_sync()
++            debug_stats["specialized_tensor_pack_ms"] = (time.perf_counter() - t0) * 1000.0
++
++        t1 = time.perf_counter()
++        wrapper = BatchPrefillWithPagedKVCacheWrapper(
++            self._float_workspace_buffer,
++            backend=self._backend,
++        )
++        if debug_enabled:
++            debug_stats["specialized_wrapper_init_ms"] = (time.perf_counter() - t1) * 1000.0
++
++        t2 = time.perf_counter()
++        if kv_data_type is None:
++            kv_data_type = q_data_type
++        if self._backend == "auto":
++            wrapper._backend = determine_attention_backend(
++                self.device,
++                PosEncodingMode[pos_encoding_mode].value,
++                use_fp16_qk_reduction,
++                False,
++                q_data_type,
++                kv_data_type,
++            )
++        if wrapper._backend != "fa2":
++            if debug_enabled:
++                debug_stats["specialized_fallback_backend"] = 1.0
++            self._plan_concurrent(
++                indptr_per_head=indptr_per_head,
++                indices_per_head=indices_per_head,
++                pos_encoding_mode=pos_encoding_mode,
++                use_fp16_qk_reduction=use_fp16_qk_reduction,
++                logits_soft_cap=logits_soft_cap,
++                sm_scale=sm_scale,
++                rope_scale=rope_scale,
++                rope_theta=rope_theta,
++                q_data_type=q_data_type,
++                kv_data_type=kv_data_type,
++                o_data_type=o_data_type,
++                non_blocking=non_blocking,
++            )
++            return
++
++        avg_packed_qo_len = (
++            int(qo_boundaries.diff().to(torch.float32).mean().item()) * self.group_size
++        )
++        cta_tile_q = self._determine_cta_tile_q(avg_packed_qo_len)
++
++        qo_indptr_host = qo_indptr.to("cpu")
++        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
++        row_page_counts = paged_kv_indptr_host[1:] - paged_kv_indptr_host[:-1]
++        qo_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
++        kv_lens = torch.where(
++            row_page_counts > 0,
++            (row_page_counts - 1) * self.C + self.C,
++            torch.zeros_like(row_page_counts),
++        )
++        num_tiles_q = torch.div(qo_lens + cta_tile_q - 1, cta_tile_q, rounding_mode="floor")
++        max_tiles_q = int(num_tiles_q.max().item()) if num_tiles_q.numel() else 0
++        tile_grid = torch.arange(max_tiles_q, dtype=torch.int32).unsqueeze(0)
++        tile_mask = tile_grid < num_tiles_q.unsqueeze(1)
++        request_indices = torch.arange(
++            self.num_kv_heads * self.num_block_rows, dtype=torch.int32
++        ).unsqueeze(1).expand(-1, max_tiles_q)[tile_mask]
++        qo_tile_indices = tile_grid.expand(self.num_kv_heads * self.num_block_rows, -1)[tile_mask]
++        kv_tile_indices = torch.zeros_like(request_indices)
++        o_indptr = qo_indptr_host.to(torch.int32).contiguous()
++        kv_chunk_size_ptr = torch.tensor([self.C], dtype=torch.int32)
++
++        offset = 0
++        request_indices_offset = self._aligned_offset(offset, 16)
++        offset = request_indices_offset + request_indices.numel() * request_indices.element_size()
++        qo_tile_indices_offset = self._aligned_offset(offset, 16)
++        offset = qo_tile_indices_offset + qo_tile_indices.numel() * qo_tile_indices.element_size()
++        kv_tile_indices_offset = self._aligned_offset(offset, 16)
++        offset = kv_tile_indices_offset + kv_tile_indices.numel() * kv_tile_indices.element_size()
++        o_indptr_offset = self._aligned_offset(offset, 16)
++        offset = o_indptr_offset + o_indptr.numel() * o_indptr.element_size()
++        kv_chunk_size_ptr_offset = self._aligned_offset(offset, 1)
++        offset = kv_chunk_size_ptr_offset + kv_chunk_size_ptr.numel() * kv_chunk_size_ptr.element_size()
++        used_bytes = offset
++        if used_bytes > wrapper._pin_memory_int_workspace_buffer.numel():
++            raise RuntimeError(
++                "Specialized per-head plan exceeds int workspace buffer size. "
++                f"Need {used_bytes} bytes, have {wrapper._pin_memory_int_workspace_buffer.numel()}."
++            )
++        host_buffer = wrapper._pin_memory_int_workspace_buffer
++        host_buffer[:used_bytes].zero_()
++        self._write_int_workspace_tensor(
++            host_buffer, offset=request_indices_offset, data=request_indices
++        )
++        self._write_int_workspace_tensor(
++            host_buffer, offset=qo_tile_indices_offset, data=qo_tile_indices
++        )
++        self._write_int_workspace_tensor(
++            host_buffer, offset=kv_tile_indices_offset, data=kv_tile_indices
++        )
++        self._write_int_workspace_tensor(host_buffer, offset=o_indptr_offset, data=o_indptr)
++        self._write_int_workspace_tensor(
++            host_buffer, offset=kv_chunk_size_ptr_offset, data=kv_chunk_size_ptr
++        )
++        wrapper._int_workspace_buffer[:used_bytes].copy_(
++            host_buffer[:used_bytes], non_blocking=False
++        )
++
++        wrapper._qo_indptr_buf = qo_indptr
++        wrapper._paged_kv_indptr_buf = paged_kv_indptr
++        wrapper._paged_kv_indices_buf = paged_kv_indices
++        wrapper._paged_kv_last_page_len_buf = paged_kv_last_page_len
++        wrapper._custom_mask_buf = None
++        wrapper._mask_indptr_buf = None
++        wrapper._prefix_len_ptr = None
++        wrapper._token_pos_in_items_ptr = None
++        wrapper._token_pos_in_items_len = 0
++        wrapper._max_item_len_ptr = None
++        wrapper._batch_size = self.num_kv_heads * self.num_block_rows
++        wrapper._num_qo_heads = self.group_size
++        wrapper._num_kv_heads = 1
++        wrapper._qo_indptr_last = int(qo_indptr_host[-1].item())
++        wrapper._max_q_len = int(qo_lens.max().item()) if qo_lens.numel() else 0
++        wrapper._max_kv_len = int(kv_lens.max().item()) if kv_lens.numel() else 0
++        if wrapper._kv_lens_buffer.shape[0] < kv_lens.numel():
++            wrapper._kv_lens_buffer = torch.empty(
++                (kv_lens.numel(),), dtype=torch.int32, device=self.device
++            )
++        wrapper._kv_lens_buffer[: kv_lens.numel()].copy_(
++            kv_lens.to(self.device), non_blocking=non_blocking
++        )
++        wrapper._cached_q_data_type = q_data_type
++        wrapper._cached_kv_data_type = kv_data_type
++        wrapper._cached_o_data_type = o_data_type
++        wrapper._cached_module = get_batch_prefill_module(
++            wrapper._backend,
++            q_data_type,
++            kv_data_type,
++            o_data_type,
++            paged_kv_indptr.dtype,
++            self.head_dim,
++            self.head_dim,
++            PosEncodingMode[pos_encoding_mode].value,
++            False,
++            (logits_soft_cap or 0.0) > 0,
++            use_fp16_qk_reduction,
++        )
++        wrapper._plan_info = [
++            int(request_indices.numel()),
++            int(qo_indptr_host[-1].item()),
++            0,
++            int(cta_tile_q),
++            int(request_indices_offset),
++            int(qo_tile_indices_offset),
++            int(kv_tile_indices_offset),
++            0,
++            int(o_indptr_offset),
++            int(kv_chunk_size_ptr_offset),
++            0,
++            0,
++            0,
++            0,
++            0,
++        ]
++        wrapper._causal = False
++        wrapper._pos_encoding_mode = pos_encoding_mode
++        wrapper._use_fp16_qk_reduction = use_fp16_qk_reduction
++        wrapper._window_left = -1
++        wrapper._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
++        wrapper._sm_scale = sm_scale
++        wrapper._rope_scale = rope_scale
++        wrapper._rope_theta = rope_theta
++        wrapper._seq_lens_kv = None
++        wrapper._seq_lens_q = None
++        wrapper._block_tables = None
++        if debug_enabled:
++            self._maybe_sync()
++            debug_stats["specialized_plan_build_ms"] = (time.perf_counter() - t2) * 1000.0
++            debug_stats["specialized_cta_tile_q"] = float(cta_tile_q)
++            debug_stats["specialized_batch_size"] = float(wrapper._batch_size)
++            debug_stats["specialized_new_batch_size"] = float(request_indices.numel())
++            debug_stats["specialized_backend_fa2"] = 1.0
++
++        self._concurrent_wrapper = wrapper
++        self._sequential_wrappers = []
++
++    def run(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++    ) -> torch.Tensor:
++        if not self._planned:
++            raise RuntimeError("plan() must be called before run().")
++        self._validate_qkv(q, k, v)
++        if self._sequential_heads:
++            return self._run_sequential(q, k, v)
++        return self._run_concurrent(q, k, v)
++
++    forward = run
++
++    def _run_sequential(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
++        outputs = []
++        for head_idx, wrapper in enumerate(self._sequential_wrappers):
++            q_start = head_idx * self.group_size
++            q_end = q_start + self.group_size
++            outputs.append(
++                wrapper.run(
++                    q[:, q_start:q_end, :].contiguous(),
++                    k[:, head_idx : head_idx + 1, :].contiguous(),
++                    v[:, head_idx : head_idx + 1, :].contiguous(),
++                )
++            )
++        return torch.cat(outputs, dim=1)
++
++    def _run_concurrent(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
++        if self._concurrent_wrapper is None:
++            raise RuntimeError("Concurrent plan is not initialized.")
++
++        q_flat = (
++            q.reshape(self.M, self.num_kv_heads, self.group_size, self.head_dim)
++            .permute(1, 0, 2, 3)
++            .contiguous()
++            .reshape(self.num_kv_heads * self.M, self.group_size, self.head_dim)
++        )
++        k_pages = (
++            k.reshape(self.num_block_cols, self.C, self.num_kv_heads, self.head_dim)
++            .permute(2, 0, 1, 3)
++            .contiguous()
++            .reshape(self.num_kv_heads * self.num_block_cols, self.C, 1, self.head_dim)
++        )
++        v_pages = (
++            v.reshape(self.num_block_cols, self.C, self.num_kv_heads, self.head_dim)
++            .permute(2, 0, 1, 3)
++            .contiguous()
++            .reshape(self.num_kv_heads * self.num_block_cols, self.C, 1, self.head_dim)
++        )
++        out_flat = self._concurrent_wrapper.run(q_flat, (k_pages, v_pages))
++        del q_flat, k_pages, v_pages
++        out = (
++            out_flat.reshape(self.num_kv_heads, self.M, self.group_size, self.head_dim)
++            .permute(1, 0, 2, 3)
++            .contiguous()
++            .reshape(self.M, self.num_qo_heads, self.head_dim)
++        )
++        del out_flat
++        return out
++
++    def _validate_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
++        expected_q = (self.M, self.num_qo_heads, self.head_dim)
++        expected_kv = (self.N, self.num_kv_heads, self.head_dim)
++        if tuple(q.shape) != expected_q:
++            raise ValueError(f"Expected q shape {expected_q}, got {tuple(q.shape)}.")
++        if tuple(k.shape) != expected_kv:
++            raise ValueError(f"Expected k shape {expected_kv}, got {tuple(k.shape)}.")
++        if tuple(v.shape) != expected_kv:
++            raise ValueError(f"Expected v shape {expected_kv}, got {tuple(v.shape)}.")
++        if q.device != self.device or k.device != self.device or v.device != self.device:
++            raise ValueError("q, k, and v must be on the same device as the workspace buffer.")
++
++    def end_forward(self) -> None:
++        pass
+diff --git a/tests/attention/test_per_head_bsaw.py b/tests/attention/test_per_head_bsaw.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa38b3066eec6908ab056fec16d9247d5a4c2163
+--- /dev/null
++++ b/tests/attention/test_per_head_bsaw.py
+@@ -0,0 +1,134 @@
++import pytest
++import torch
++
++import flashinfer
++from flashinfer.per_head_bsaw import PerHeadBlockSparseAttentionWrapper
++
++
++def _mask_to_csr(mask: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
++    indptr_per_head: list[torch.Tensor] = []
++    indices_per_head: list[torch.Tensor] = []
++    for head_idx in range(mask.shape[0]):
++        head_mask = mask[head_idx]
++        row_counts = head_mask.sum(dim=1, dtype=torch.int32)
++        indptr = torch.zeros(
++            head_mask.shape[0] + 1,
++            dtype=torch.int32,
++            device=head_mask.device,
++        )
++        indptr[1:] = torch.cumsum(row_counts, dim=0)
++        indices = torch.nonzero(head_mask, as_tuple=False)[:, 1].to(torch.int32).contiguous()
++        indptr_per_head.append(indptr)
++        indices_per_head.append(indices)
++    return indptr_per_head, indices_per_head
++
++
++def _reference(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    mask: torch.Tensor,
++    block_size: int,
++) -> torch.Tensor:
++    num_kv_heads = k.shape[1]
++    group_size = q.shape[1] // num_kv_heads
++    outputs = []
++    for head_idx in range(num_kv_heads):
++        dense_mask = mask[head_idx].repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
++        outputs.append(
++            flashinfer.single_prefill_with_kv_cache(
++                q[:, head_idx * group_size : (head_idx + 1) * group_size, :].contiguous(),
++                k[:, head_idx : head_idx + 1, :].contiguous(),
++                v[:, head_idx : head_idx + 1, :].contiguous(),
++                custom_mask=dense_mask,
++            )
++        )
++    return torch.cat(outputs, dim=1)
++
++
++@pytest.mark.parametrize("num_kv_heads,group_size", [(1, 1), (2, 2)])
++def test_per_head_bsaw_matches_reference(num_kv_heads: int, group_size: int):
++    torch.manual_seed(7)
++    device = "cuda"
++    block_size = 128
++    seq_len = 256
++    head_dim = 128
++    num_qo_heads = num_kv_heads * group_size
++
++    mask = torch.tensor(
++        [
++            [[1, 1], [0, 1]],
++            [[1, 0], [1, 1]],
++        ][:num_kv_heads],
++        dtype=torch.bool,
++        device=device,
++    )
++    indptr_per_head, indices_per_head = _mask_to_csr(mask)
++
++    q = torch.randn(seq_len, num_qo_heads, head_dim, dtype=torch.float16, device=device)
++    k = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
++    v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
++    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++
++    reference = _reference(q, k, v, mask, block_size)
++
++    concurrent = PerHeadBlockSparseAttentionWrapper(workspace)
++    concurrent.plan(
++        indptr_per_head,
++        indices_per_head,
++        seq_len,
++        seq_len,
++        block_size,
++        block_size,
++        num_qo_heads,
++        num_kv_heads,
++        head_dim,
++        q_data_type=q.dtype,
++        kv_data_type=k.dtype,
++        o_data_type=q.dtype,
++    )
++    torch.testing.assert_close(concurrent.run(q, k, v), reference, atol=1e-2, rtol=1e-2)
++
++    sequential = PerHeadBlockSparseAttentionWrapper(workspace)
++    sequential.plan(
++        indptr_per_head,
++        indices_per_head,
++        seq_len,
++        seq_len,
++        block_size,
++        block_size,
++        num_qo_heads,
++        num_kv_heads,
++        head_dim,
++        sequential_heads=True,
++        q_data_type=q.dtype,
++        kv_data_type=k.dtype,
++        o_data_type=q.dtype,
++    )
++    torch.testing.assert_close(sequential.run(q, k, v), reference, atol=1e-2, rtol=1e-2)
++
++
++def test_per_head_bsaw_rejects_unimplemented_modes():
++    device = "cuda"
++    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
++    indptr = [torch.tensor([0, 1], dtype=torch.int32, device=device)]
++    indices = [torch.tensor([0], dtype=torch.int32, device=device)]
++    wrapper = PerHeadBlockSparseAttentionWrapper(workspace)
++
++    with pytest.raises(NotImplementedError, match="causal=True"):
++        wrapper.plan(indptr, indices, 128, 128, 128, 128, 1, 1, 128, causal=True)
++    with pytest.raises(NotImplementedError, match="row reordering"):
++        wrapper.plan(
++            indptr,
++            indices,
++            128,
++            128,
++            128,
++            128,
++            1,
++            1,
++            128,
++            row_perm_per_head=[torch.tensor([0], dtype=torch.int32, device=device)],
++        )
++    with pytest.raises(NotImplementedError, match="internal row reorder"):
++        wrapper.plan(indptr, indices, 128, 128, 128, 128, 1, 1, 128, reorder_algo="nnz")

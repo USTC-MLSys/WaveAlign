@@ -43,3 +43,6 @@
 *.ai binary
 *.psd binary
 *.xcf binary
+
+# Preserve exact upstream context lines in the vendored FlashInfer patch.
+third_party/flashinfer/*.patch -whitespace

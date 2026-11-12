@@ -11,9 +11,7 @@ from vllm.logger import init_logger
 import atexit
 from .greedy_reorder_cuda import global_greedy_reorder_cuda, global_banded_greedy_reorder_cuda, optimal_reorder_cuda, wave_overlap_reorder, nnz_3step_reorder, bcg_l2_reorder_cuda
 from .reorder_rows_graph import reorder_rows_by_similarity
-from flash_attn.cute.interface import flash_attn_func as flash_attn_func_for_sparse_reorder
-from flash_attn.cute.interface import _flash_attn_fwd as _fa4_fwd
-from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+from vllm_omni.diffusion.attention.backends.sparse_dispatch import sparse_attention
 import os
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
@@ -367,8 +365,6 @@ class FlashAttentionImpl(AttentionImpl):
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
-        # 每个实例持有自己的tuner对象
-        self.sparse_attn_tuner = SparseAttentionMeansim()
 
     @staticmethod
     def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -563,7 +559,9 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         batch_size, q_len = query.size()[:2]
-        cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+        kv_len = key.size(1)
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * kv_len, step=kv_len, dtype=torch.int32, device=key.device)
         # b s ... -> (b s) ...
         query = query.flatten(0, 1)
         key = key.flatten(0, 1)
@@ -573,10 +571,10 @@ class FlashAttentionImpl(AttentionImpl):
             q=query,
             k=key,
             v=value,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=q_len,
-            max_seqlen_k=q_len,
+            max_seqlen_k=kv_len,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
         )
@@ -584,7 +582,13 @@ class FlashAttentionImpl(AttentionImpl):
         # (b s) h d -> b s h d
         return out.reshape(batch_size, q_len, *out.shape[1:])
 
-    def forward_cuda(
+    def forward_cuda(self, query, key, value, attn_metadata=None):
+        # Keep legacy allocations on the actual request device, including when
+        # the process's current device differs from query.device.
+        with torch.cuda.device(query.device):
+            return self._forward_cuda_on_device(query, key, value, attn_metadata)
+
+    def _forward_cuda_on_device(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -607,14 +611,7 @@ class FlashAttentionImpl(AttentionImpl):
             attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
             if attention_mask is not None and torch.any(~attention_mask):
                 return self._forward_varlen_masked(q, k, v, attention_mask)
-            dense_out = flash_attn_func(
-                q,
-                k,
-                v,
-                causal=self.causal,
-                softmax_scale=self.softmax_scale,
-            )
-            return self._unwrap_flash_output(dense_out)
+            return self._forward_varlen_dense(q, k, v)
 
         current_global_step = FlashAttentionImpl._get_global_step()
         tune_mode = int(os.environ.get("TUNE_MODE", 0))
@@ -625,7 +622,16 @@ class FlashAttentionImpl(AttentionImpl):
             or current_global_step >= sparse_warmup_steps
         )
 
-        if key.shape[1] > 4096 and sparse_ready:
+        # The research mask builders currently select masks for one noncausal
+        # self-attention sample. Preserve the existing dense backend for other
+        # inputs instead of silently reusing sample 0's mask or ignoring masks.
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        sparse_supported = (
+            query.device.type == "cuda" and torch.version.hip is None
+            and query.shape[0] == 1 and query.shape == key.shape == value.shape
+            and not self.causal and attention_mask is None
+        )
+        if key.shape[1] > 4096 and sparse_ready and sparse_supported:
             # print(f"sparse attn {current_global_step=} {FlashAttentionImpl.layeridx=}")
             sparse_mode = os.environ.get("SPARSE_MODE", "xattn")
             threshold = float(os.environ.get("VLLM_THRESHOLD", 0.9))
@@ -637,12 +643,7 @@ class FlashAttentionImpl(AttentionImpl):
                 sd1 = torch.cuda.Event(enable_timing=True)
                 sd2 = torch.cuda.Event(enable_timing=True)
                 sd1.record()
-                dense_out = flash_attn_func(
-                    query, key, value,
-                    causal=self.causal,
-                    softmax_scale=self.softmax_scale,
-                )
-                dense_out = self._unwrap_flash_output(dense_out)
+                dense_out = _dense_attention_forward(query, key, value)
                 sd2.record()
                 torch.cuda.synchronize()
                 attn_ms = sd1.elapsed_time(sd2)
@@ -847,11 +848,23 @@ class FlashAttentionImpl(AttentionImpl):
 
             # 3. Apply Reordering (Batched Chunked Greedy)
             # BLK: 64 for vsa mode (finer blocks), 128 for xattn/sparge (FA4 high-level default)
-            BLK = int(os.environ.get("VLLM_BLK", 64 if sparse_mode == "vsa" else 128))
+            capability = torch.cuda.get_device_capability(query.device)
+            default_block = 64 if sparse_mode == "vsa" or capability[0] < 9 else 128
+            BLK = int(os.environ.get("VLLM_BLK", default_block))
+            # Occupancy depends on the backend and tile size. These defaults
+            # follow the paper's 64/128-token configurations; allow an explicit
+            # override for other kernel configurations and GPU architectures.
+            sm_count = torch.cuda.get_device_properties(query.device).multi_processor_count
+            wave_size = int(os.environ.get("WAVEALIGN_WAVE_SIZE", sm_count * (2 if BLK == 64 else 1)))
+            if BLK <= 0 or wave_size <= 0:
+                raise ValueError("VLLM_BLK and WAVEALIGN_WAVE_SIZE must be positive")
             
             L_padded = ((L + BLK - 1) // BLK) * BLK
             pad_len = L_padded - L
             
+            # Retain the actual K/V lengths for softmax. Zero-padded keys are
+            # not valid keys and would change the attention normalization.
+            attention_key, attention_value = key, value
             if pad_len > 0:
                 query = torch.nn.functional.pad(query, (0,0, 0,0, 0,pad_len))
                 key = torch.nn.functional.pad(key, (0,0, 0,0, 0,pad_len))
@@ -866,7 +879,8 @@ class FlashAttentionImpl(AttentionImpl):
                 )
             
             # Estimate block attention via x-attention — PER HEAD
-            from xattn.src.Xattention import xattn_estimate
+            if sparse_mode == "xattn":
+                from xattn.src.Xattention import xattn_estimate
             # xattn_estimate expects (B, num_heads, seq_len, head_dim)
             q_est = query.transpose(1, 2).contiguous()  # (B, H, L_padded, D)
             k_est = key.transpose(1, 2).contiguous()
@@ -1043,22 +1057,14 @@ class FlashAttentionImpl(AttentionImpl):
                 k_fa4 = k_3d.transpose(1, 2).contiguous()
                 v_fa4 = v_3d.transpose(1, 2).contiguous()
 
-                bst = BlockSparseTensorsTorch(
-                    full_block_cnt=cnt_4d,
-                    full_block_idx=idx_4d,
-                    mask_block_cnt=torch.zeros_like(cnt_4d),
-                    mask_block_idx=torch.zeros(batch_size_lc, H_lc, num_q_blocks, num_k_blocks,
-                                               dtype=torch.int32, device='cuda'),
-                    block_size=(BLK_lc, BLK_lc),
-                )
-
                 s3_lc = torch.cuda.Event(enable_timing=True)
                 s4_lc = torch.cuda.Event(enable_timing=True)
                 s3_lc.record()
 
-                out_3d, _ = _fa4_fwd(
+                out_3d = sparse_attention(
                     q_fa4, k_fa4, v_fa4,
-                    block_sparse_tensors=bst,
+                    full_block_cnt=cnt_4d, full_block_idx=idx_4d,
+                    block_size=(BLK_lc, BLK_lc), softmax_scale=self.softmax_scale,
                 )
 
                 s4_lc.record()
@@ -1211,11 +1217,11 @@ class FlashAttentionImpl(AttentionImpl):
                     ("fast_greedy", lambda m: global_greedy_reorder_cuda(m.float())),
                     ("numba_reorder", lambda m: torch.stack([reorder_rows_by_similarity(m[h], metric="intersection") for h in range(m.shape[0])])),
                     ("nnz_reorder", lambda m: torch.argsort(m.float().sum(dim=2), descending=True, dim=1)),
-                    ("wave_reorder", lambda m: wave_overlap_reorder(m.float(), wave_size=132)),
-                    ("wave_1d_reorder", lambda m: __import__("vllm_omni.diffusion.attention.backends.greedy_reorder_cuda", fromlist=["wave_1d_reorder"]).wave_1d_reorder(m.float(), wave_size=132)),
-                    ("wave_2d_reorder", lambda m: __import__("vllm_omni.diffusion.attention.backends.greedy_reorder_cuda", fromlist=["wave_2d_reorder"]).wave_2d_reorder(m.float(), wave_size=132)),
-                    ("hybrid_reorder", lambda m: __import__("vllm_omni.diffusion.attention.backends.greedy_reorder_cuda", fromlist=["hybrid_block_reorder"]).hybrid_block_reorder(m.float(), wave_size=132, waves_per_block=4)),
-                    ("nnz_3step", lambda m: nnz_3step_reorder(m.float(), wave_size=132)),
+                    ("wave_reorder", lambda m: wave_overlap_reorder(m.float(), wave_size=wave_size)),
+                    ("wave_1d_reorder", lambda m: __import__("vllm_omni.diffusion.attention.backends.greedy_reorder_cuda", fromlist=["wave_1d_reorder"]).wave_1d_reorder(m.float(), wave_size=wave_size)),
+                    ("wave_2d_reorder", lambda m: __import__("vllm_omni.diffusion.attention.backends.greedy_reorder_cuda", fromlist=["wave_2d_reorder"]).wave_2d_reorder(m.float(), wave_size=wave_size)),
+                    ("hybrid_reorder", lambda m: __import__("vllm_omni.diffusion.attention.backends.greedy_reorder_cuda", fromlist=["hybrid_block_reorder"]).hybrid_block_reorder(m.float(), wave_size=wave_size, waves_per_block=4)),
+                    ("nnz_3step", lambda m: nnz_3step_reorder(m.float(), wave_size=wave_size)),
                 ]
                 for method_name, method_func in reorder_methods:
                     try:
@@ -1251,15 +1257,15 @@ class FlashAttentionImpl(AttentionImpl):
             elif mode == "wave_reorder":
                 # Wave-overlap clustering: 132-row waves with max column overlap
                 # NCU-verified: -55% DRAM read vs nnz_reorder
-                perm_all_heads = wave_overlap_reorder(mask_all_heads.float(), wave_size=132)
+                perm_all_heads = wave_overlap_reorder(mask_all_heads.float(), wave_size=wave_size)
             elif mode == "wave_1d_reorder":
                 from vllm_omni.diffusion.attention.backends.greedy_reorder_cuda import wave_1d_reorder
-                perm_all_heads = wave_1d_reorder(mask_all_heads.float(), wave_size=132)
+                perm_all_heads = wave_1d_reorder(mask_all_heads.float(), wave_size=wave_size)
             elif mode == "nnz_3step" or mode == "nnz_3step_reorder":
-                perm_all_heads = nnz_3step_reorder(mask_all_heads.float(), wave_size=132)
+                perm_all_heads = nnz_3step_reorder(mask_all_heads.float(), wave_size=wave_size)
             elif mode == "svd_deflation_reorder":
                 from vllm_omni.diffusion.attention.backends.greedy_reorder_cuda import svd_deflation_reorder
-                perm_all_heads = svd_deflation_reorder(mask_all_heads.float(), wave_size=132)
+                perm_all_heads = svd_deflation_reorder(mask_all_heads.float(), wave_size=wave_size)
             elif mode in ("svd_cumulative_rib_reorder", "nnz_head_aligned_reorder"):
                 if (batch_size != 1 or self.causal
                         or (BLK, D) != (128, 128) or key.shape[2] != H
@@ -1275,13 +1281,13 @@ class FlashAttentionImpl(AttentionImpl):
                 )
             elif mode == "svd_u2u3_reorder":
                 from vllm_omni.diffusion.attention.backends.greedy_reorder_cuda import svd_u2u3_reorder
-                perm_all_heads = svd_u2u3_reorder(mask_all_heads.float(), wave_size=132)
+                perm_all_heads = svd_u2u3_reorder(mask_all_heads.float(), wave_size=wave_size)
             elif mode == "wave_2d_reorder":
                 from vllm_omni.diffusion.attention.backends.greedy_reorder_cuda import wave_2d_reorder
-                perm_all_heads = wave_2d_reorder(mask_all_heads.float(), wave_size=132)
+                perm_all_heads = wave_2d_reorder(mask_all_heads.float(), wave_size=wave_size)
             elif mode == "hybrid_reorder":
                 from vllm_omni.diffusion.attention.backends.greedy_reorder_cuda import hybrid_block_reorder
-                perm_all_heads = hybrid_block_reorder(mask_all_heads.float(), wave_size=132, waves_per_block=4)
+                perm_all_heads = hybrid_block_reorder(mask_all_heads.float(), wave_size=wave_size, waves_per_block=4)
             else:
                 perm_all_heads = torch.arange(MB, device='cuda').unsqueeze(0).expand(H, MB).contiguous()
             
@@ -1317,35 +1323,14 @@ class FlashAttentionImpl(AttentionImpl):
             cnt_4d = cnt_all.unsqueeze(0).expand(batch_size, H, MB).contiguous()
             idx_4d = sorted_cols_all.unsqueeze(0).expand(batch_size, H, MB, NB).contiguous()
             
-            sp = {
-                "full_block_cnt": cnt_4d,
-                "full_block_idx": idx_4d,
-                "mask_block_cnt": torch.zeros_like(cnt_4d),
-                "mask_block_idx": torch.zeros(batch_size, H, MB, NB, dtype=torch.int32, device='cuda'),
-                "block_size": (BLK, BLK),
-            }
             s_r5.record()
             
             s3.record()
-            if BLK != 128:
-                # Use low-level FA4 API for non-128 block sizes
-                bst = BlockSparseTensorsTorch(
-                    full_block_cnt=sp["full_block_cnt"],
-                    full_block_idx=sp["full_block_idx"],
-                    mask_block_cnt=sp["mask_block_cnt"],
-                    mask_block_idx=sp["mask_block_idx"],
-                    block_size=(BLK, BLK),
-                )
-                out_reordered, _ = _fa4_fwd(
-                    q_reordered, key, value,
-                    tile_mn=(BLK, BLK),
-                    block_sparse_tensors=bst,
-                )
-            else:
-                out_reordered = flash_attn_func_for_sparse_reorder(
-                    q_reordered, key, value,
-                    **sp
-                )
+            out_reordered = sparse_attention(
+                q_reordered, attention_key, attention_value,
+                full_block_cnt=cnt_4d, full_block_idx=idx_4d,
+                block_size=(BLK, BLK), softmax_scale=self.softmax_scale,
+            )
             s4.record()
             
             if isinstance(out_reordered, tuple):

@@ -30,6 +30,9 @@ from torch.utils.cpp_extension import load_inline
 _cuda_source = r"""
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 
 // =============================================================================
 // Kernel 1: Original global greedy reorder (pre-computed similarity matrix)
@@ -124,6 +127,7 @@ __global__ void greedy_reorder_kernel(
 }
 
 torch::Tensor greedy_reorder_cuda(torch::Tensor S) {
+    const c10::cuda::CUDAGuard device_guard(S.device());
     int H = S.size(0);
     int MB = S.size(1);
     auto perm = torch::zeros({H, MB}, torch::dtype(torch::kInt64).device(S.device()));
@@ -131,11 +135,12 @@ torch::Tensor greedy_reorder_cuda(torch::Tensor S) {
 
     int threads = 256;
     int smem = threads * (sizeof(float) + sizeof(int));
-    greedy_reorder_kernel<<<H, threads, smem>>>(
+    greedy_reorder_kernel<<<H, threads, smem, c10::cuda::getCurrentCUDAStream()>>>(
         S_work.data_ptr<float>(),
         perm.data_ptr<int64_t>(),
         H, MB
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return perm;
 }
 
@@ -275,13 +280,14 @@ torch::Tensor banded_greedy_reorder_cuda(
     int H, int MB, int NB,
     int max_band_size
 ) {
+    const c10::cuda::CUDAGuard device_guard(mask.device());
     auto perm = torch::zeros({H, MB}, torch::dtype(torch::kInt64).device(mask.device()));
 
     int threads = 256;
     // smem: curr_cache(NB*4) + smax(256*4) + sidx(256*4) + visited(max_band_size)
     int smem = NB * sizeof(float) + threads * (sizeof(float) + sizeof(int)) + max_band_size;
 
-    banded_greedy_reorder_kernel<<<total_bands, threads, smem>>>(
+    banded_greedy_reorder_kernel<<<total_bands, threads, smem, c10::cuda::getCurrentCUDAStream()>>>(
         mask.data_ptr<float>(),
         band_row_idx.data_ptr<int>(),
         band_offsets.data_ptr<int>(),
@@ -290,6 +296,7 @@ torch::Tensor banded_greedy_reorder_cuda(
         perm.data_ptr<int64_t>(),
         MB, NB
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return perm;
 }
 
@@ -416,6 +423,7 @@ __global__ void window_greedy_reorder_kernel(
 }
 
 torch::Tensor window_greedy_reorder_cuda(torch::Tensor S, int W, torch::Tensor lengths) {
+    const c10::cuda::CUDAGuard device_guard(S.device());
     int H = S.size(0);
     int MB = S.size(1);
     auto perm = torch::zeros({H, MB}, torch::dtype(torch::kInt64).device(S.device()));
@@ -428,13 +436,14 @@ torch::Tensor window_greedy_reorder_cuda(torch::Tensor S, int W, torch::Tensor l
 
     int threads = 256;
     int smem = threads * (sizeof(float) + sizeof(int));
-    window_greedy_reorder_kernel<<<H, threads, smem>>>(
+    window_greedy_reorder_kernel<<<H, threads, smem, c10::cuda::getCurrentCUDAStream()>>>(
         S_work.data_ptr<float>(),
         perm.data_ptr<int64_t>(),
         wsum.data_ptr<float>(),
         lengths_ptr,
         H, MB, W
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return perm;
 }
 
@@ -581,13 +590,14 @@ torch::Tensor banded_window_greedy_reorder_cuda(
     int H, int MB, int NB,
     int W, int max_band_size
 ) {
+    const c10::cuda::CUDAGuard device_guard(mask.device());
     auto perm = sorted_indices.clone();
     if (total_bands == 0) return perm;
 
     int threads = 256;
     int smem = NB * sizeof(float) + threads * (sizeof(float) + sizeof(int)) + max_band_size;
 
-    banded_window_greedy_reorder_kernel<<<total_bands, threads, smem>>>(
+    banded_window_greedy_reorder_kernel<<<total_bands, threads, smem, c10::cuda::getCurrentCUDAStream()>>>(
         mask.data_ptr<float>(),
         sorted_indices.data_ptr<int64_t>(),
         band_heads.data_ptr<int>(),
@@ -596,6 +606,7 @@ torch::Tensor banded_window_greedy_reorder_cuda(
         perm.data_ptr<int64_t>(),
         MB, NB, W
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return perm;
 }
 """
@@ -631,15 +642,15 @@ _ext = None
 def _get_ext():
     global _ext
     if _ext is None:
-        # Pin to sm_90 to avoid "Unknown CUDA arch" on multi-GPU systems
-        os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+        # Let PyTorch target the visible GPUs (or the caller's explicit
+        # TORCH_CUDA_ARCH_LIST); an SM90-only binary cannot run on Ampere.
         _ext = load_inline(
             name="greedy_reorder",
             cpp_sources=_cpp_source,
             cuda_sources=_cuda_source,
             functions=["greedy_reorder_cuda", "window_greedy_reorder_cuda", "banded_greedy_reorder_cuda", "banded_window_greedy_reorder_cuda"],
             verbose=False,
-            extra_cuda_cflags=["-O3", "--generate-code=arch=compute_90,code=sm_90"],
+            extra_cuda_cflags=["-O3"],
         )
     return _ext
 
@@ -806,7 +817,7 @@ def global_banded_window_greedy_reorder_cuda(mask_float, band_size=4, max_band_r
                 S = torch.bmm(band_mask, band_mask.transpose(1, 2))  # (1, cl, cl)
                 
                 # Kernel 3: window-lookback greedy on pre-computed S
-                local_perm = ext.window_greedy_reorder_cuda(S, min(window, cl))[0]
+                local_perm = ext.window_greedy_reorder_cuda(S, min(window, cl), torch.full((1,), cl, dtype=torch.int32, device=device))[0]
                 perm[h, cs:ce] = band_row_idx[local_perm]
     
     return perm
@@ -976,71 +987,53 @@ def optimal_reorder_cuda(mask_float, band_size=4, max_band_rows=512, window=132)
     
     return perm
 
-def wave_2d_reorder(mask_float, wave_size=132):
-    """Wave-Overlap Reorder (Original 2D): batched spectral clustering via power iteration SVD.
-    
-    SVD-quality top-2 singular vectors computed via batched power iteration.
-    All ops batched across H heads. ~20 GPU kernel launches, no .item() calls.
-    
-    NCU-verified: -80% DRAM read vs nnz, -5% kernel time (SVD quality).
-    """
-    H, MB, NB = mask_float.shape
-    device = mask_float.device
-    nnz = mask_float.sum(dim=2)  # (H, MB)
-    n_waves = (MB + wave_size - 1) // wave_size
-    
-    # Step 1: Batched power iteration for top-2 left singular vectors
-    # Initialize with fixed random seed for reproducibility
-    gen = torch.Generator(device=device).manual_seed(42)
-    V = torch.randn(H, NB, 2, device=device, generator=gen)  # (H, NB, 2)
-    V = V / V.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    
-    # 10 power iterations: converges to top-2 singular vectors
-    for _ in range(10):
-        U = torch.bmm(mask_float, V)            # (H, MB, 2)
-        U = U / U.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        V = torch.bmm(mask_float.transpose(1, 2), U)  # (H, NB, 2)
-        V = V / V.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    
-    # U[:, :, 0] ≈ 1st left singular vector (captures NNZ/mean)
-    # U[:, :, 1] ≈ 2nd left singular vector (captures column pattern variation)
-    # Use components 1,2 (skip component 0 which captures NNZ)
-    proj = U[:, :, 0:2]  # (H, MB, 2) — try both components
-    proj = proj - proj.mean(dim=1, keepdim=True)  # center to remove mean bias
-    
-    # Step 2: Sort by angle (batched)
-    angles = torch.atan2(proj[:, :, 1], proj[:, :, 0])  # (H, MB)
-    spectral_order = angles.argsort(dim=1)  # (H, MB)
-    
-    # Step 3: Partition into waves + reorder by NNZ (fully batched)
-    pad = n_waves * wave_size - MB
-    if pad > 0:
-        # Pad with dummy items to form full waves without introducing index overlaps
-        pad_idx = torch.arange(MB, MB + pad, device=device).unsqueeze(0).expand(H, -1)
-        spectral_order_pad = torch.cat([spectral_order, pad_idx], dim=1)
-        nnz_pad = torch.cat([nnz, torch.zeros(H, pad, dtype=nnz.dtype, device=device)], dim=1)
-    else:
-        spectral_order_pad = spectral_order
-        nnz_pad = nnz
+def _centered_rank2_basis(mask_float, n_iter=10):
+    """Paper Algorithm 1: matrix-free centered subspace iteration.
 
-    nnz_ordered = torch.gather(nnz_pad, 1, spectral_order_pad)
-    nnz_waves = nnz_ordered.view(H, n_waves, wave_size)
-    wave_mean_nnz = nnz_waves.float().mean(dim=2)
-    
-    wave_order = wave_mean_nnz.argsort(dim=1, descending=True)
-    within_wave_order = nnz_waves.argsort(dim=2, descending=True)
-    
-    spectral_waves = spectral_order_pad.view(H, n_waves, wave_size)
-    spectral_sorted = torch.gather(spectral_waves, 2, within_wave_order)
-    
-    wave_order_exp = wave_order.unsqueeze(2).expand(H, n_waves, wave_size)
-    result_padded = torch.gather(spectral_sorted, 1, wave_order_exp)
-    
-    # Filter out the dummy padding indices and restore valid shape
-    valid_mask = result_padded < MB
-    result = result_padded[valid_mask].view(H, MB).contiguous()
-    
-    return result
+    Centering is applied by rank-one corrections, and QR prevents the two
+    columns from collapsing onto the same dominant direction. Products use
+    PyTorch's dense batched matmul here; this is not an O(nnz) sparse kernel.
+    """
+    heads, rows, _ = mask_float.shape
+    generator = torch.Generator(device=mask_float.device).manual_seed(42)
+    basis = torch.randn(heads, rows, 2, device=mask_float.device,
+                        dtype=mask_float.dtype, generator=generator)
+    basis = torch.linalg.qr(basis, mode="reduced").Q
+    column_sum = mask_float.sum(dim=1)
+    transpose = mask_float.transpose(1, 2)
+    for _ in range(n_iter):
+        right = torch.bmm(transpose, basis)
+        right = right - column_sum[:, :, None] * (basis.sum(dim=1, keepdim=True) / rows)
+        left = torch.bmm(mask_float, right)
+        correction = (column_sum[:, :, None] * right).sum(dim=1, keepdim=True) / rows
+        basis = torch.linalg.qr(left - correction, mode="reduced").Q
+    return basis
+
+
+def _wavealign_stage2(order, nnz, wave_size):
+    """Sort within each Stage-1 wave while preserving the wave order."""
+    heads, rows = order.shape
+    pad = (-rows) % wave_size
+    ordered_counts = nnz.gather(1, order)
+    if pad:
+        order = torch.nn.functional.pad(order, (0, pad), value=0)
+        ordered_counts = torch.nn.functional.pad(ordered_counts, (0, pad), value=-float("inf"))
+    rank = ordered_counts.reshape(heads, -1, wave_size).argsort(dim=2, descending=True, stable=True)
+    refined = order.reshape(heads, -1, wave_size).gather(2, rank)
+    return refined.reshape(heads, -1)[:, :rows].contiguous()
+
+
+def wave_2d_reorder(mask_float, wave_size=132):
+    """Paper Algorithms 1/2: centered rank-2 projection and intra-wave NNZ sort."""
+    if mask_float.ndim != 3 or min(mask_float.shape) <= 0 or wave_size <= 0:
+        raise ValueError("Expected a nonempty [heads, Q blocks, KV blocks] mask and positive wave size")
+    mask_float = mask_float.float()
+    nnz = mask_float.sum(dim=2)
+    if min(mask_float.shape[1:]) < 2:
+        return nnz.argsort(dim=1, descending=True, stable=True)
+    basis = _centered_rank2_basis(mask_float)
+    order = torch.atan2(basis[:, :, 1], basis[:, :, 0]).argsort(dim=1, stable=True)
+    return _wavealign_stage2(order, nnz, wave_size)
 
 
 def wave_overlap_reorder(mask_float, wave_size=132):
