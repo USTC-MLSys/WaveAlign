@@ -44,6 +44,7 @@ Use `VLLM_MODE=no_reorder` for the sparse baseline or `VLLM_MODE=nnz_reorder` fo
 - [Video generation and profiling](examples/offline_inference/text_to_video/)
 - [GPU validation and limitations](docs/wavealign_validation.md)
 - [Real Wan model results](docs/wavealign_real_model_validation.md)
+- [Wan2.2 long-sequence results](docs/wavealign_wan22_validation.md)
 
 ## Acknowledgments and License
 
