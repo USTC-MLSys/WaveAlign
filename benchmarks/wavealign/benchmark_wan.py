@@ -77,13 +77,12 @@ class State:
         padded = ((length + block - 1) // block) * block
         padding = padded - length
         qpad = F.pad(q, (0, 0, 0, 0, 0, padding)) if padding else q
-        kpad = F.pad(k, (0, 0, 0, 0, 0, padding)) if padding else k
         rows = padded // block
         stamps = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
         stamps[0].record()
         _, estimated = xattn_estimate(
-            qpad.transpose(1, 2).contiguous(),
-            kpad.transpose(1, 2).contiguous(),
+            q.transpose(1, 2).contiguous(),
+            k.transpose(1, 2).contiguous(),
             block_size=block,
             stride=16,
             norm=1,

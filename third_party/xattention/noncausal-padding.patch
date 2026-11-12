@@ -1,0 +1,73 @@
+--- a/xattn/src/Xattention.py
++++ b/xattn/src/Xattention.py
+@@ -169,9 +169,11 @@
+                 (k_block_num - q_block_num) * reshaped_block_size
+                 + chunk_idx * reshaped_chunk_size
+                 + reshaped_chunk_size,
+-                k_reshaped_seq_len - k_reshaped_num_to_pad,
++                (k_reshaped_seq_len - k_reshaped_num_to_pad) if causal else
++                offset_token_chunk_num * reshaped_chunk_size + (q_len + stride - 1) // stride,
+                 1.4426950408889634 / math.sqrt(head_dim) / stride / norm,
+                 is_causal=causal,
++                real_k_len=(k_len + stride - 1) // stride,
+             )
+         else:
+             chunked_query = reshaped_query[
+@@ -227,6 +229,12 @@
+                     attn_weights_slice.device
+                 )
+ 
++            if not causal:
++                # Padding is storage, not a real key: exclude it from both
++                # normalization and the cumulative-attention block selection.
++                valid_key_groups = (k_len + stride - 1) // stride
++                attn_weights_slice[:, :, :, valid_key_groups:] = float("-inf")
++
+             if softmax:
+                 attn_weights_slice = F.softmax(
+                     attn_weights_slice, dim=-1, dtype=torch.float32
+--- a/xattn/src/kernels.py
++++ b/xattn/src/kernels.py
+@@ -106,6 +106,7 @@
+     output_stride_1,
+     output_stride_2,
+     real_q_len,
++    real_k_len,
+     k_len, # we assume k_len is divisible by chunk size
+     chunk_start,
+     chunk_end,
+@@ -132,6 +133,8 @@
+ 
+     for iter in range(0, num_iters):
+         X = tl.load(input_ptr + iter * segment_size).to(tl.float32) * scale
++        valid_k = offs_k[None, :] + iter * segment_size < real_k_len
++        X = tl.where(valid_k, X, -float("inf"))
+         m_local = tl.max(X, 1)
+         m_new = tl.maximum(m_i, m_local)
+         alpha = tl.math.exp2(m_i - m_new)
+@@ -148,6 +151,8 @@
+ 
+     for iter in range(0, num_iters):
+         X = tl.load(input_ptr + iter * segment_size).to(tl.float32) * scale
++        valid_k = offs_k[None, :] + iter * segment_size < real_k_len
++        X = tl.where(valid_k, X, -float("inf"))
+         X = tl.exp2(X - m_i[:, None]) * l_i_inv[:, None]
+         X = tl.where(sum_mask, X, 0)
+         X = tl.reshape(X, (block_size, segment_size // block_size, block_size))
+@@ -235,7 +240,7 @@
+     tl.store(O_ptrs, o.to(Out.type.element_ty))
+ 
+ 
+-def softmax_fuse_block_sum(attn_weights_slice, reshaped_block_size, segment_size, chunk_start, chunk_end, real_q_len, scale, is_causal=True):
++def softmax_fuse_block_sum(attn_weights_slice, reshaped_block_size, segment_size, chunk_start, chunk_end, real_q_len, scale, is_causal=True, real_k_len=None):
+     batch_size, num_heads, q_len, k_len = attn_weights_slice.shape
+     assert q_len % reshaped_block_size == 0
+     try:
+@@ -279,6 +284,7 @@
+             output.stride(1),
+             output.stride(2),
+             real_q_len,
++            real_q_len if real_k_len is None else real_k_len,
+             k_len,
+             chunk_start,
+             chunk_end,

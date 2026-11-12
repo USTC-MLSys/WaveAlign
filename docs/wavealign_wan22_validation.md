@@ -1,5 +1,7 @@
 # Wan2.2 A14B: sequence-length and GPU-capacity validation
 
+**Historical estimator configuration:** these measurements preceded the [noncausal XAttention padding fix](../third_party/xattention/README.md). Output-equivalence checks remain valid for those shared masks, but affected densities and model outputs must be refreshed before treating them as results for the corrected estimator. See the [Stage 1 and density investigation](wavealign_stage1_density.md).
+
 Actual Wan2.2 weights were tested on one A100-SXM4-80GB. Increasing sequence length changes the balance between kernel savings and reordering overhead, but neither model size nor sequence length guarantees a net speedup for every mask.
 
 ## Sparse method and kernel

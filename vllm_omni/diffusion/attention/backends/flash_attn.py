@@ -882,8 +882,12 @@ class FlashAttentionImpl(AttentionImpl):
             if sparse_mode == "xattn":
                 from xattn.src.Xattention import xattn_estimate
             # xattn_estimate expects (B, num_heads, seq_len, head_dim)
-            q_est = query.transpose(1, 2).contiguous()  # (B, H, L_padded, D)
-            k_est = key.transpose(1, 2).contiguous()
+            # XAttention pads internally and needs the real lengths to exclude
+            # padded keys from its softmax and block selection.
+            estimator_query = query[:, :L] if sparse_mode == "xattn" else query
+            estimator_key = key[:, :L] if sparse_mode == "xattn" else key
+            q_est = estimator_query.transpose(1, 2).contiguous()
+            k_est = estimator_key.transpose(1, 2).contiguous()
             
             # Run xattn_estimate on ALL heads independently
             # mask_all_heads: (H, MB, NB) — per-head block mask

@@ -1,5 +1,7 @@
 # Real-model GPU validation (2026-11-12)
 
+**Historical estimator configuration:** these runs preceded the [noncausal XAttention padding fix](../third_party/xattention/README.md). Their paired output comparisons use the same pre-fix masks; they do not verify the corrected mask selection. See the [subsequent investigation](wavealign_stage1_density.md).
+
 Actual pretrained Wan2.1-T2V-1.3B inference was run on one NVIDIA A100-SXM4-80GB, including the native vLLM-Omni entrypoint. **Reordering preserved the outputs exactly, but the current implementation did not improve total generation latency on these configurations.**
 
 ## Results
